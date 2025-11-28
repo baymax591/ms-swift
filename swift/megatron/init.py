@@ -9,6 +9,12 @@ from copy import copy
 from typing import List, Optional, Tuple
 
 import peft
+try:
+    # Enable Megatron on Ascend NPU
+    import mindspeed
+    HAS_MINDSPEED = True
+except ImportError:
+    HAS_MINDSPEED = False
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -638,13 +644,16 @@ def _patch_mrope():
         Returns:
             Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
         """
-        use_batched_rope = False
         if cp_group is not None:
             cp_size = cp_group.size()
-            cu_seqlens_for_batched = cu_seqlens // cp_size
-            use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
+        else:
+            args = get_args()
+            cp_size = args.context_parallel_size
+        cu_seqlens_for_batched = cu_seqlens // cp_size
+        use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
         if not use_batched_rope:
             logger.warning_once('Using non-batched RoPE, which may affect performance.')
+            kwargs = {'cp_group': cp_group} if mcore_013 else {}
             return _origin_apply_rotary_pos_emb_thd(
                 t,
                 cu_seqlens,
@@ -652,10 +661,8 @@ def _patch_mrope():
                 rotary_interleaved=rotary_interleaved,
                 multi_latent_attention=multi_latent_attention,
                 mscale=mscale,
-                cp_group=cp_group,
+                **kwargs,
             )
-        if cp_group is None:
-            raise ValueError('cp_group must be provided for THD format RoPE')
 
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
@@ -706,6 +713,9 @@ def _patch_megatron():
 
 
 def init_megatron_env() -> None:
+    if HAS_MINDSPEED:
+        from mindspeed.megatron_adaptor import repatch
+        repatch({})
     if 'MEGATRON_LM_PATH' not in os.environ:
         # TODO: Synchronization issues may occur in DDP scenarios
         # if the distributed environment has not been initialized.
